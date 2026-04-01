@@ -1,0 +1,36 @@
+// swift-tools-version:5.9
+import PackageDescription
+
+let package = Package(
+    name: "backend",
+    platforms: [.macOS(.v13)],
+    dependencies: [
+        .package(url: "https://github.com/vapor/vapor.git", from: "4.99.3"),
+        .package(url: "https://github.com/vapor/fluent.git", from: "4.9.0"),
+        .package(url: "https://github.com/vapor/fluent-sqlite-driver.git", from: "4.7.0"),
+    ],
+    targets: [
+        .executableTarget(
+            name: "Run",
+            dependencies: [.target(name: "App")],
+            path: "Sources/Run"
+        ),
+        .target(
+            name: "App",
+            dependencies: [
+                .product(name: "Vapor", package: "vapor"),
+                .product(name: "Fluent", package: "fluent"),
+                .product(name: "FluentSQLiteDriver", package: "fluent-sqlite-driver"),
+            ],
+            path: "Sources/App",
+            swiftSettings: swiftSettings
+        ),
+    ]
+)
+
+var swiftSettings: [SwiftSetting] {
+    [
+        .enableUpcomingFeature("DisableOutwardActorInference"),
+        .enableExperimentalFeature("StrictConcurrency"),
+    ]
+}
