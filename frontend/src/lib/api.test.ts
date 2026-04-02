@@ -1,10 +1,19 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest';
-import { api } from './api';
+import { api, type Todo } from './api';
 
 const mockFetch = vi.fn();
 vi.stubGlobal('fetch', mockFetch);
 
-const fakeTodo = { id: 'abc-123', title: 'Test todo', isComplete: false, createdAt: null };
+const fakeTodo: Todo = {
+	id: 'abc-123',
+	title: 'Test todo',
+	isComplete: false,
+	timeSpent: 0,
+	status: 'todo',
+	priority: 'none',
+	dueDate: null,
+	createdAt: null,
+};
 
 function makeResponse(data: unknown, status = 200) {
 	return {
@@ -34,7 +43,7 @@ describe('api.list', () => {
 describe('api.create', () => {
 	it('posts to /api/todos and returns the new todo', async () => {
 		mockFetch.mockResolvedValue(makeResponse(fakeTodo, 201));
-		const todo = await api.create('Test todo');
+		const todo = await api.create({ title: 'Test todo' });
 		expect(todo).toEqual(fakeTodo);
 		expect(mockFetch).toHaveBeenCalledWith(
 			'/api/todos',
@@ -44,7 +53,7 @@ describe('api.create', () => {
 
 	it('throws HTTP 422 when server rejects the title', async () => {
 		mockFetch.mockResolvedValue(makeResponse('Title cannot be empty', 422));
-		await expect(api.create('')).rejects.toThrow('HTTP 422');
+		await expect(api.create({ title: '' })).rejects.toThrow('HTTP 422');
 	});
 });
 
@@ -52,7 +61,7 @@ describe('api.update', () => {
 	it('puts to /api/todos/:id', async () => {
 		const updated = { ...fakeTodo, title: 'Updated' };
 		mockFetch.mockResolvedValue(makeResponse(updated));
-		const result = await api.update('abc-123', { title: 'Updated', isComplete: false });
+		const result = await api.update('abc-123', { title: 'Updated', status: 'todo' as const });
 		expect(result.title).toBe('Updated');
 		expect(mockFetch).toHaveBeenCalledWith('/api/todos/abc-123', expect.objectContaining({ method: 'PUT' }));
 	});
@@ -72,20 +81,22 @@ describe('api.delete', () => {
 });
 
 describe('api.toggle', () => {
-	it('flips isComplete from false to true', async () => {
-		const toggled = { ...fakeTodo, isComplete: true };
+	it('flips todo to done (false → true)', async () => {
+		const toggled = { ...fakeTodo, isComplete: true, status: 'done' as const };
 		mockFetch.mockResolvedValue(makeResponse(toggled));
 		const result = await api.toggle(fakeTodo);
 		expect(result.isComplete).toBe(true);
 		const body = JSON.parse(mockFetch.mock.calls[0][1].body);
-		expect(body.isComplete).toBe(true);
+		expect(body.status).toBe('done');
 	});
 
-	it('flips isComplete from true to false', async () => {
-		const completedTodo = { ...fakeTodo, isComplete: true };
-		const toggled = { ...fakeTodo, isComplete: false };
+	it('flips done to todo (true → false)', async () => {
+		const completedTodo = { ...fakeTodo, isComplete: true, status: 'done' as const };
+		const toggled = { ...fakeTodo, isComplete: false, status: 'todo' as const };
 		mockFetch.mockResolvedValue(makeResponse(toggled));
 		const result = await api.toggle(completedTodo);
 		expect(result.isComplete).toBe(false);
+		const body = JSON.parse(mockFetch.mock.calls[0][1].body);
+		expect(body.status).toBe('todo');
 	});
 });

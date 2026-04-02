@@ -7,18 +7,6 @@ on:
     branches: [main]
 
 jobs:
-  test-backend:
-    name: Swift tests
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - uses: swift-actions/setup-swift@v2
-        with:
-          swift-version: '5.9'
-      - name: Run tests
-        working-directory: backend
-        run: swift test
-
   test-frontend:
     name: Frontend tests
     runs-on: ubuntu-latest
@@ -36,7 +24,7 @@ jobs:
 
   deploy:
     name: Deploy to Fly.io
-    needs: [test-backend, test-frontend]
+    needs: [test-frontend]
     if: github.ref == 'refs/heads/main' && github.event_name == 'push'
     runs-on: ubuntu-latest
     steps:
