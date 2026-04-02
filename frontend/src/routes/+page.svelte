@@ -489,6 +489,7 @@
               {#each cards as todo (todo.id)}
                 {@const badge = dueBadge(todo.dueDate)}
                 {@const timing = activeTimerId === todo.id}
+                {@const sp = subtaskProgress(todo.id)}
                 <div
                   class="task-card"
                   class:dragging={draggingId === todo.id}
@@ -516,7 +517,6 @@
                     <p class="card-desc">{todo.description.length > 80 ? todo.description.slice(0, 80) + '…' : todo.description}</p>
                   {/if}
 
-                  {@const sp = subtaskProgress(todo.id)}
                   {#if sp.total > 0}
                     <div class="subtask-bar-wrap">
                       <div class="subtask-bar">
@@ -646,6 +646,7 @@
               {#each filteredTodos as todo (todo.id)}
                 {@const badge = dueBadge(todo.dueDate)}
                 {@const timing = activeTimerId === todo.id}
+                {@const sp = subtaskProgress(todo.id)}
                 <tr class="task-row" class:row-done={todo.status === 'done'}>
 
                   <td class="td-check">
@@ -685,7 +686,6 @@
                         {#if todo.description}
                           <span class="row-desc">{todo.description.length > 60 ? todo.description.slice(0, 60) + '…' : todo.description}</span>
                         {/if}
-                        {@const sp = subtaskProgress(todo.id)}
                         {#if sp.total > 0}
                           <span class="row-subtask-badge">{sp.done}/{sp.total} subtasks</span>
                         {/if}
