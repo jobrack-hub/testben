@@ -22,8 +22,7 @@ let package = Package(
                 .product(name: "Fluent", package: "fluent"),
                 .product(name: "FluentSQLiteDriver", package: "fluent-sqlite-driver"),
             ],
-            path: "Sources/App",
-            swiftSettings: swiftSettings
+            path: "Sources/App"
         ),
         .testTarget(
             name: "AppTests",
@@ -32,15 +31,7 @@ let package = Package(
                 .product(name: "XCTVapor", package: "vapor"),
                 .product(name: "FluentSQLiteDriver", package: "fluent-sqlite-driver"),
             ],
-            path: "Tests/AppTests",
-            swiftSettings: swiftSettings
+            path: "Tests/AppTests"
         ),
     ]
 )
-
-var swiftSettings: [SwiftSetting] {
-    [
-        .enableUpcomingFeature("DisableOutwardActorInference"),
-        .enableExperimentalFeature("StrictConcurrency"),
-    ]
-}
