@@ -7,7 +7,10 @@ export default defineConfig({
 		host: true,
 		allowedHosts: 'all',
 		proxy: {
-			'/api': 'http://localhost:8080'
+			'/api': {
+				target: 'https://bold-bush-3730.fly.dev',
+				changeOrigin: true,
+			}
 		}
 	}
 });

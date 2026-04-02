@@ -1,605 +1,1499 @@
 <script lang="ts">
-  import { onMount } from 'svelte';
-  import { api, type Todo } from '$lib/api';
+  import { onMount, onDestroy } from 'svelte';
+  import { api, type Todo, type Status, type Priority, type TaskInput } from '$lib/api';
 
-  let todos = $state<Todo[]>([]);
-  let newTitle = $state('');
+  // ── Core data ─────────────────────────────────────────────────────────────
+  let todos   = $state<Todo[]>([]);
   let loading = $state(true);
-  let error = $state<string | null>(null);
-  let filter = $state<'all' | 'active' | 'done'>('all');
-  let editingId = $state<string | null>(null);
+  let error   = $state<string | null>(null);
+
+  // ── View ──────────────────────────────────────────────────────────────────
+  let view = $state<'board' | 'list'>('board');
+
+  // ── Modal (new task) ──────────────────────────────────────────────────────
+  let showModal     = $state(false);
+  let modalTitle    = $state('');
+  let modalStatus   = $state<Status>('todo');
+  let modalPriority = $state<Priority>('none');
+  let modalDueDate  = $state('');
+  let modalSaving   = $state(false);
+
+  // ── Inline edit (list view) ───────────────────────────────────────────────
+  let editingId    = $state<string | null>(null);
   let editingTitle = $state('');
 
-  const remaining = $derived(todos.filter(t => !t.isComplete).length);
-  const done = $derived(todos.filter(t => t.isComplete).length);
-  const filtered = $derived(
-    filter === 'active' ? todos.filter(t => !t.isComplete)
-    : filter === 'done'  ? todos.filter(t => t.isComplete)
-    : todos
-  );
+  // ── Timer ─────────────────────────────────────────────────────────────────
+  let activeTimerId = $state<string | null>(null);
+  let sessionStart  = $state(0);
+  let tick          = $state(0);
+  let timerInterval: ReturnType<typeof setInterval> | null = null;
 
-  onMount(async () => {
-    try {
-      todos = await api.list();
-    } catch (e) {
-      error = e instanceof Error ? e.message : 'Failed to load todos';
-    } finally {
-      loading = false;
-    }
+  // ── Drag & drop ───────────────────────────────────────────────────────────
+  let draggingId  = $state<string | null>(null);
+  let dragOverCol = $state<Status | null>(null);
+
+  // ── Derived ───────────────────────────────────────────────────────────────
+  const colTodo     = $derived(todos.filter(t => t.status === 'todo'));
+  const colProgress = $derived(todos.filter(t => t.status === 'in_progress'));
+  const colDone     = $derived(todos.filter(t => t.status === 'done'));
+
+  const totalCount  = $derived(todos.length);
+  const activeCount = $derived(todos.filter(t => t.status !== 'done').length);
+  const doneCount   = $derived(todos.filter(t => t.status === 'done').length);
+
+  const totalTracked = $derived.by(() => {
+    void tick;
+    return todos.reduce((sum, t) => {
+      const live = activeTimerId === t.id
+        ? Math.floor((Date.now() - sessionStart) / 1000) : 0;
+      return sum + t.timeSpent + live;
+    }, 0);
   });
 
-  async function addTodo() {
-    const title = newTitle.trim();
-    if (!title) return;
-    try {
-      todos = [...todos, await api.create(title)];
-      newTitle = '';
-    } catch (e) {
-      error = e instanceof Error ? e.message : 'Failed to create todo';
+  const navTimerLabel = $derived.by(() => {
+    void tick;
+    if (!activeTimerId) return null;
+    const t = todos.find(t => t.id === activeTimerId);
+    if (!t) return null;
+    const secs = t.timeSpent + Math.floor((Date.now() - sessionStart) / 1000);
+    return `${fmt(secs)}  ${t.title}`;
+  });
+
+  // ── Timer helpers ─────────────────────────────────────────────────────────
+  function startInterval() {
+    timerInterval = setInterval(() => tick++, 1000);
+  }
+
+  function clearTimerLoop() {
+    if (timerInterval) { clearInterval(timerInterval); timerInterval = null; }
+  }
+
+  async function stopActiveTimer() {
+    if (!activeTimerId) return;
+    const elapsed = Math.floor((Date.now() - sessionStart) / 1000);
+    const id = activeTimerId;
+    clearTimerLoop();
+    activeTimerId = null;
+    sessionStart  = 0;
+    if (elapsed > 0) {
+      const todo = todos.find(t => t.id === id);
+      if (todo) {
+        try {
+          const updated = await api.update(id, {
+            title: todo.title, status: todo.status,
+            priority: todo.priority, timeSpent: todo.timeSpent + elapsed,
+          });
+          todos = todos.map(t => t.id === updated.id ? updated : t);
+        } catch { error = 'Failed to save time'; }
+      }
     }
   }
 
-  async function toggleTodo(todo: Todo) {
-    try {
-      const updated = await api.toggle(todo);
-      todos = todos.map(t => (t.id === updated.id ? updated : t));
-    } catch (e) {
-      error = e instanceof Error ? e.message : 'Failed to update todo';
+  async function toggleTimer(todo: Todo) {
+    if (activeTimerId === todo.id) {
+      await stopActiveTimer();
+    } else {
+      await stopActiveTimer();
+      activeTimerId = todo.id;
+      sessionStart  = Date.now();
+      startInterval();
     }
   }
 
-  async function deleteTodo(id: string) {
+  function liveSeconds(todo: Todo): number {
+    void tick;
+    return activeTimerId === todo.id
+      ? todo.timeSpent + Math.floor((Date.now() - sessionStart) / 1000)
+      : todo.timeSpent;
+  }
+
+  // ── CRUD ──────────────────────────────────────────────────────────────────
+  function openModal() {
+    modalTitle = ''; modalStatus = 'todo';
+    modalPriority = 'none'; modalDueDate = '';
+    showModal = true;
+  }
+
+  async function createTask() {
+    const title = modalTitle.trim();
+    if (!title || modalSaving) return;
+    modalSaving = true;
+    try {
+      const task = await api.create({
+        title,
+        status:   modalStatus,
+        priority: modalPriority,
+        dueDate:  modalDueDate || null,
+      });
+      todos = [...todos, task];
+      showModal = false;
+    } catch (e) {
+      error = e instanceof Error ? e.message : 'Failed to create task';
+    } finally {
+      modalSaving = false;
+    }
+  }
+
+  async function deleteTask(id: string) {
+    if (activeTimerId === id) { clearTimerLoop(); activeTimerId = null; }
     try {
       await api.delete(id);
       todos = todos.filter(t => t.id !== id);
     } catch (e) {
-      error = e instanceof Error ? e.message : 'Failed to delete todo';
+      error = e instanceof Error ? e.message : 'Failed to delete task';
     }
   }
 
+  async function updateTaskField(todo: Todo, patch: TaskInput) {
+    try {
+      const updated = await api.update(todo.id, {
+        title: todo.title, status: todo.status,
+        priority: todo.priority, timeSpent: todo.timeSpent,
+        dueDate: todo.dueDate, ...patch,
+      });
+      todos = todos.map(t => t.id === updated.id ? updated : t);
+    } catch (e) {
+      error = e instanceof Error ? e.message : 'Failed to update task';
+    }
+  }
+
+  async function moveToStatus(id: string, status: Status) {
+    const todo = todos.find(t => t.id === id);
+    if (!todo || todo.status === status) return;
+    if (activeTimerId === id) await stopActiveTimer();
+    await updateTaskField(todo, { status });
+  }
+
   function startEdit(todo: Todo) {
-    editingId = todo.id;
-    editingTitle = todo.title;
+    editingId = todo.id; editingTitle = todo.title;
   }
 
   async function commitEdit(todo: Todo) {
     const title = editingTitle.trim();
     editingId = null;
     if (!title || title === todo.title) return;
-    try {
-      const updated = await api.update(todo.id, { title, isComplete: todo.isComplete });
-      todos = todos.map(t => (t.id === updated.id ? updated : t));
-    } catch (e) {
-      error = e instanceof Error ? e.message : 'Failed to update todo';
-    }
+    await updateTaskField(todo, { title });
   }
 
-  function cancelEdit() {
-    editingId = null;
-    editingTitle = '';
+  function cancelEdit() { editingId = null; }
+
+  // ── Drag & drop ───────────────────────────────────────────────────────────
+  function onDragStart(e: DragEvent, todo: Todo) {
+    e.dataTransfer?.setData('text/plain', todo.id);
+    draggingId = todo.id;
   }
+
+  function onDragOver(e: DragEvent, col: Status) {
+    e.preventDefault();
+    dragOverCol = col;
+  }
+
+  function onDrop(e: DragEvent, col: Status) {
+    e.preventDefault();
+    if (draggingId) moveToStatus(draggingId, col);
+    draggingId = null; dragOverCol = null;
+  }
+
+  function onDragEnd() { draggingId = null; dragOverCol = null; }
+
+  // ── Formatters ────────────────────────────────────────────────────────────
+  function fmt(s: number): string {
+    if (s === 0) return '0:00';
+    const h = Math.floor(s / 3600);
+    const m = Math.floor((s % 3600) / 60);
+    const sec = s % 60;
+    if (h > 0) return `${h}h ${String(m).padStart(2, '0')}m`;
+    return `${m}:${String(sec).padStart(2, '0')}`;
+  }
+
+  function fmtTotal(s: number): string {
+    if (s === 0) return '0m';
+    const h = Math.floor(s / 3600);
+    const m = Math.floor((s % 3600) / 60);
+    return h > 0 ? `${h}h ${m}m` : `${m}m`;
+  }
+
+  function fmtDate(iso: string): string {
+    const d = new Date(iso + 'T00:00:00');
+    return d.toLocaleDateString('en-GB', { day: 'numeric', month: 'short' });
+  }
+
+  function dueBadge(dueDate: string | null): { label: string; cls: string } | null {
+    if (!dueDate) return null;
+    const today = new Date().toISOString().slice(0, 10);
+    const diff  = Math.ceil(
+      (new Date(dueDate + 'T00:00:00').getTime() - new Date(today + 'T00:00:00').getTime())
+      / 86400000
+    );
+    if (diff < 0)  return { label: 'Overdue',  cls: 'due-overdue' };
+    if (diff === 0) return { label: 'Today',    cls: 'due-today'   };
+    if (diff <= 3)  return { label: 'Soon',     cls: 'due-soon'    };
+    return { label: fmtDate(dueDate), cls: 'due-future' };
+  }
+
+  // ── Lifecycle ─────────────────────────────────────────────────────────────
+  onMount(async () => {
+    try { todos = await api.list(); }
+    catch (e) { error = e instanceof Error ? e.message : 'Failed to load'; }
+    finally   { loading = false; }
+  });
+
+  onDestroy(() => clearTimerLoop());
+
+  // ── Config ────────────────────────────────────────────────────────────────
+  const COLUMNS: { status: Status; label: string; colorClass: string }[] = [
+    { status: 'todo',        label: 'To Do',       colorClass: 'col-todo'     },
+    { status: 'in_progress', label: 'In Progress', colorClass: 'col-progress' },
+    { status: 'done',        label: 'Done',         colorClass: 'col-done'    },
+  ];
+
+  function colCards(status: Status) {
+    return status === 'todo' ? colTodo
+         : status === 'in_progress' ? colProgress
+         : colDone;
+  }
+
+  const PRIORITY_LABELS: Record<Priority, string> = {
+    none: '', low: 'Low', medium: 'Medium', high: 'High', urgent: 'Urgent',
+  };
 </script>
 
 <svelte:head>
-  <title>My Tasks</title>
+  <title>TaskFlow</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&family=JetBrains+Mono:wght@500&display=swap" rel="stylesheet">
 </svelte:head>
 
-<header>
-  <div class="header-inner">
-    <div class="brand">
-      <span class="brand-dot"></span>
-      <span class="brand-name">TaskFlow</span>
+<div class="app">
+
+  <!-- ── Navbar ── -->
+  <nav class="navbar">
+    <div class="nav-left">
+      <span class="brand">
+        <span class="brand-icon">T</span>
+        TaskFlow
+      </span>
+      <div class="view-tabs">
+        <button class="view-tab" class:active={view === 'board'} onclick={() => view = 'board'}>
+          <svg width="14" height="14" viewBox="0 0 14 14" fill="none" aria-hidden="true">
+            <rect x="0" y="0" width="4" height="9" rx="1.5" fill="currentColor"/>
+            <rect x="5" y="2" width="4" height="12" rx="1.5" fill="currentColor"/>
+            <rect x="10" y="1" width="4" height="7" rx="1.5" fill="currentColor"/>
+          </svg>
+          Board
+        </button>
+        <button class="view-tab" class:active={view === 'list'} onclick={() => view = 'list'}>
+          <svg width="14" height="14" viewBox="0 0 14 14" fill="none" aria-hidden="true">
+            <rect x="0" y="1" width="14" height="2" rx="1" fill="currentColor"/>
+            <rect x="0" y="6" width="14" height="2" rx="1" fill="currentColor"/>
+            <rect x="0" y="11" width="14" height="2" rx="1" fill="currentColor"/>
+          </svg>
+          List
+        </button>
+      </div>
     </div>
-    {#if !loading && todos.length > 0}
-      <div class="header-filters">
-        <button
-          class="hf-btn"
-          class:active={filter === 'active'}
-          onclick={() => filter = filter === 'active' ? 'all' : 'active'}
-        >
-          <strong>{remaining}</strong> left
-        </button>
-        <span class="stat-divider"></span>
-        <button
-          class="hf-btn"
-          class:active={filter === 'done'}
-          onclick={() => filter = filter === 'done' ? 'all' : 'done'}
-        >
-          <strong>{done}</strong> done
-        </button>
-      </div>
-    {/if}
-  </div>
-</header>
 
-<main>
-  <div class="card">
-    <div class="card-top">
-      <div>
-        <h1>My Tasks</h1>
-        <p class="subtitle">Stay on top of what matters.</p>
-      </div>
-
-      <!-- Filter tabs -->
-      {#if !loading && todos.length > 0}
-        <div class="tabs">
-          <button class="tab" class:active={filter === 'all'}    onclick={() => filter = 'all'}>All</button>
-          <button class="tab" class:active={filter === 'active'} onclick={() => filter = 'active'}>Active</button>
-          <button class="tab" class:active={filter === 'done'}   onclick={() => filter = 'done'}>Done</button>
+    <div class="nav-center">
+      {#if navTimerLabel}
+        <div class="timer-pill">
+          <span class="timer-dot"></span>
+          {navTimerLabel}
         </div>
       {/if}
     </div>
 
-    {#if error}
-      <div class="error" role="alert">
-        <span>⚠ {error}</span>
-        <button onclick={() => (error = null)}>✕</button>
+    <div class="nav-right">
+      <button class="btn-new" onclick={openModal}>
+        <svg width="12" height="12" viewBox="0 0 12 12" fill="none" aria-hidden="true">
+          <path d="M6 1v10M1 6h10" stroke="currentColor" stroke-width="2" stroke-linecap="round"/>
+        </svg>
+        New Task
+      </button>
+    </div>
+  </nav>
+
+  <!-- ── Stats bar ── -->
+  <div class="stats-bar">
+    <div class="stat">
+      <span class="stat-val">{totalCount}</span>
+      <span class="stat-lbl">Total</span>
+    </div>
+    <div class="stat-divider"></div>
+    <div class="stat">
+      <span class="stat-val">{activeCount}</span>
+      <span class="stat-lbl">Active</span>
+    </div>
+    <div class="stat-divider"></div>
+    <div class="stat">
+      <span class="stat-val done-val">{doneCount}</span>
+      <span class="stat-lbl">Done</span>
+    </div>
+    <div class="stat-divider"></div>
+    <div class="stat">
+      <span class="stat-val grad-val">{fmtTotal(totalTracked)}</span>
+      <span class="stat-lbl">Tracked</span>
+    </div>
+    {#if totalCount > 0}
+      <div class="stat-divider"></div>
+      <div class="stat progress-stat">
+        <div class="mini-progress">
+          <div class="mini-fill" style="width:{Math.round(doneCount/totalCount*100)}%"></div>
+        </div>
+        <span class="stat-lbl">{Math.round(doneCount/totalCount*100)}% complete</span>
       </div>
     {/if}
+  </div>
 
-    <div class="add-form">
-      <input
-        type="text"
-        bind:value={newTitle}
-        onkeydown={e => e.key === 'Enter' && addTodo()}
-        placeholder="Add a new task…"
-        aria-label="New task"
-      />
-      <button class="btn-add" onclick={addTodo} disabled={!newTitle.trim()}>+ Add</button>
-    </div>
+  <!-- ── Content ── -->
+  <main class="content">
 
     {#if loading}
-      <div class="loading-state">
+      <div class="state-center">
         <div class="spinner"></div>
-        <span>Loading tasks…</span>
+        <span class="state-text">Loading your workspace…</span>
       </div>
-    {:else if filtered.length === 0}
-      <div class="empty-state">
-        <div class="empty-icon">{filter === 'done' ? '✓' : filter === 'active' ? '◎' : '✓'}</div>
-        <p>
-          {filter === 'done'   ? 'Nothing completed yet.'
-           : filter === 'active' ? 'Nothing left to do!'
-           : 'Add a task above to get started.'}
-        </p>
-      </div>
-    {:else}
-      <ul class="todo-list">
-        {#each filtered as todo (todo.id)}
-          <li class:complete={todo.isComplete}>
-            <!-- Checkbox -->
-            <button
-              class="check-btn"
-              class:checked={todo.isComplete}
-              onclick={() => toggleTodo(todo)}
-              aria-label="Toggle {todo.title}"
-            >
-              {#if todo.isComplete}
-                <svg width="12" height="12" viewBox="0 0 12 12" fill="none">
-                  <path d="M2 6l3 3 5-5" stroke="white" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>
-                </svg>
+
+    {:else if view === 'board'}
+      <!-- ════ BOARD VIEW ════ -->
+      <div class="board">
+        {#each COLUMNS as col}
+          {@const cards = colCards(col.status)}
+          <div
+            class="board-col {col.colorClass}"
+            class:drag-over={dragOverCol === col.status}
+            ondragover={e => onDragOver(e, col.status)}
+            ondrop={e => onDrop(e, col.status)}
+          >
+            <div class="col-header">
+              <span class="col-dot"></span>
+              <span class="col-label">{col.label}</span>
+              <span class="col-count">{cards.length}</span>
+            </div>
+
+            <div class="col-body">
+              {#each cards as todo (todo.id)}
+                {@const badge = dueBadge(todo.dueDate)}
+                {@const timing = activeTimerId === todo.id}
+                <div
+                  class="task-card"
+                  class:dragging={draggingId === todo.id}
+                  class:timing
+                  draggable="true"
+                  ondragstart={e => onDragStart(e, todo)}
+                  ondragend={onDragEnd}
+                >
+                  <div class="card-meta">
+                    {#if todo.priority !== 'none'}
+                      <span class="pri-badge pri-{todo.priority}">
+                        {PRIORITY_LABELS[todo.priority]}
+                      </span>
+                    {/if}
+                    {#if badge}
+                      <span class="due-chip {badge.cls}">{badge.label}</span>
+                    {/if}
+                  </div>
+
+                  <p class="card-title" class:done-title={todo.status === 'done'}>
+                    {todo.title}
+                  </p>
+
+                  <div class="card-footer">
+                    <span class="card-time" class:live={timing}>
+                      {fmt(liveSeconds(todo))}
+                    </span>
+                    <div class="card-actions">
+                      {#if todo.status !== 'done'}
+                        <button
+                          class="card-btn timer-btn"
+                          class:active={timing}
+                          onclick={() => toggleTimer(todo)}
+                          aria-label={timing ? 'Pause' : 'Start timer'}
+                        >
+                          {#if timing}
+                            <svg width="9" height="11" viewBox="0 0 9 11" fill="currentColor">
+                              <rect x="0" y="0" width="3" height="11" rx="1"/>
+                              <rect x="6" y="0" width="3" height="11" rx="1"/>
+                            </svg>
+                          {:else}
+                            <svg width="9" height="11" viewBox="0 0 9 11" fill="currentColor">
+                              <path d="M0 0l9 5.5L0 11V0z"/>
+                            </svg>
+                          {/if}
+                        </button>
+                      {/if}
+                      <button class="card-btn del-btn" onclick={() => deleteTask(todo.id)} aria-label="Delete">
+                        <svg width="10" height="10" viewBox="0 0 10 10" fill="none">
+                          <path d="M1 1l8 8M9 1L1 9" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"/>
+                        </svg>
+                      </button>
+                    </div>
+                  </div>
+                </div>
+              {/each}
+
+              {#if cards.length === 0}
+                <div class="col-empty">Drop tasks here</div>
               {/if}
-            </button>
-
-            <!-- Title or edit input -->
-            {#if editingId === todo.id}
-              <input
-                class="edit-input"
-                bind:value={editingTitle}
-                onkeydown={e => {
-                  if (e.key === 'Enter') commitEdit(todo);
-                  if (e.key === 'Escape') cancelEdit();
-                }}
-                onblur={() => commitEdit(todo)}
-                autofocus
-              />
-            {:else}
-              <span class="title" ondblclick={() => startEdit(todo)}>{todo.title}</span>
-            {/if}
-
-            <!-- Edit button -->
-            {#if editingId !== todo.id}
-              <button class="icon-btn edit-btn" onclick={() => startEdit(todo)} aria-label="Edit {todo.title}">
-                <svg width="14" height="14" viewBox="0 0 14 14" fill="none">
-                  <path d="M9.5 2.5l2 2L4 12H2v-2L9.5 2.5z" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/>
-                </svg>
-              </button>
-            {/if}
-
-            <!-- Delete button -->
-            <button class="icon-btn delete-btn" onclick={() => deleteTodo(todo.id)} aria-label="Delete {todo.title}">
-              <svg width="14" height="14" viewBox="0 0 14 14" fill="none">
-                <path d="M1 1l12 12M13 1L1 13" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"/>
-              </svg>
-            </button>
-          </li>
+            </div>
+          </div>
         {/each}
-      </ul>
+      </div>
 
-      {#if done > 0 && filter !== 'active'}
-        <div class="progress-bar-wrap">
-          <div class="progress-bar" style="width: {Math.round((done / todos.length) * 100)}%"></div>
-        </div>
-        <p class="progress-label">{Math.round((done / todos.length) * 100)}% complete</p>
-      {/if}
+    {:else}
+      <!-- ════ LIST VIEW ════ -->
+      <div class="list-wrap">
+        {#if todos.length === 0}
+          <div class="state-center">
+            <div class="empty-icon">
+              <svg width="22" height="22" viewBox="0 0 22 22" fill="none">
+                <rect x="2" y="2" width="18" height="18" rx="4" stroke="currentColor" stroke-width="1.5"/>
+                <path d="M7 11h8M7 7h5M7 15h6" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"/>
+              </svg>
+            </div>
+            <span class="state-text">No tasks yet. Hit <strong>New Task</strong> to start.</span>
+          </div>
+        {:else}
+          <table class="task-table">
+            <thead>
+              <tr>
+                <th class="th-check"></th>
+                <th class="th-title">Title</th>
+                <th class="th-status">Status</th>
+                <th class="th-priority">Priority</th>
+                <th class="th-due">Due</th>
+                <th class="th-time">Time</th>
+                <th class="th-actions"></th>
+              </tr>
+            </thead>
+            <tbody>
+              {#each todos as todo (todo.id)}
+                {@const badge = dueBadge(todo.dueDate)}
+                {@const timing = activeTimerId === todo.id}
+                <tr class="task-row" class:row-done={todo.status === 'done'}>
+
+                  <td class="td-check">
+                    <button
+                      class="check-btn"
+                      class:checked={todo.status === 'done'}
+                      onclick={() => updateTaskField(todo, { status: todo.status === 'done' ? 'todo' : 'done' })}
+                      aria-label="Toggle done"
+                    >
+                      {#if todo.status === 'done'}
+                        <svg width="9" height="9" viewBox="0 0 9 9" fill="none">
+                          <path d="M1 4.5l2.5 2.5 4.5-4.5" stroke="white" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/>
+                        </svg>
+                      {/if}
+                    </button>
+                  </td>
+
+                  <td class="td-title">
+                    {#if editingId === todo.id}
+                      <input
+                        class="inline-edit"
+                        bind:value={editingTitle}
+                        onkeydown={e => {
+                          if (e.key === 'Enter') commitEdit(todo);
+                          if (e.key === 'Escape') cancelEdit();
+                        }}
+                        onblur={() => commitEdit(todo)}
+                        autofocus
+                      />
+                    {:else}
+                      <span
+                        class="title-text"
+                        class:done-title={todo.status === 'done'}
+                        ondblclick={() => startEdit(todo)}
+                      >{todo.title}</span>
+                    {/if}
+                  </td>
+
+                  <td class="td-status">
+                    <select
+                      class="sel status-sel status-{todo.status}"
+                      value={todo.status}
+                      onchange={e => updateTaskField(todo, { status: e.currentTarget.value as Status })}
+                    >
+                      <option value="todo">To Do</option>
+                      <option value="in_progress">In Progress</option>
+                      <option value="done">Done</option>
+                    </select>
+                  </td>
+
+                  <td class="td-priority">
+                    <select
+                      class="sel priority-sel pri-sel-{todo.priority}"
+                      value={todo.priority}
+                      onchange={e => updateTaskField(todo, { priority: e.currentTarget.value as Priority })}
+                    >
+                      <option value="none">—</option>
+                      <option value="low">Low</option>
+                      <option value="medium">Medium</option>
+                      <option value="high">High</option>
+                      <option value="urgent">Urgent</option>
+                    </select>
+                  </td>
+
+                  <td class="td-due">
+                    {#if badge && todo.dueDate}
+                      <span class="due-pill {badge.cls}">
+                        {fmtDate(todo.dueDate)}
+                      </span>
+                    {:else}
+                      <span class="no-val">—</span>
+                    {/if}
+                  </td>
+
+                  <td class="td-time">
+                    <span class="time-mono" class:live={timing}>{fmt(liveSeconds(todo))}</span>
+                    {#if todo.status !== 'done'}
+                      <button
+                        class="row-timer"
+                        class:active={timing}
+                        onclick={() => toggleTimer(todo)}
+                        aria-label={timing ? 'Pause' : 'Start timer'}
+                      >
+                        {#if timing}
+                          <svg width="8" height="10" viewBox="0 0 8 10" fill="currentColor">
+                            <rect x="0" y="0" width="2.5" height="10" rx="1"/>
+                            <rect x="5.5" y="0" width="2.5" height="10" rx="1"/>
+                          </svg>
+                        {:else}
+                          <svg width="8" height="10" viewBox="0 0 8 10" fill="currentColor">
+                            <path d="M0 0l8 5L0 10V0z"/>
+                          </svg>
+                        {/if}
+                      </button>
+                    {/if}
+                  </td>
+
+                  <td class="td-actions">
+                    <button class="row-del" onclick={() => deleteTask(todo.id)} aria-label="Delete">
+                      <svg width="11" height="11" viewBox="0 0 11 11" fill="none">
+                        <path d="M1 1l9 9M10 1L1 10" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"/>
+                      </svg>
+                    </button>
+                  </td>
+                </tr>
+              {/each}
+            </tbody>
+          </table>
+        {/if}
+      </div>
     {/if}
-  </div>
-</main>
+  </main>
+
+  <!-- ── New Task Modal ── -->
+  {#if showModal}
+    <div
+      class="backdrop"
+      role="presentation"
+      onclick={e => e.target === e.currentTarget && (showModal = false)}
+      onkeydown={e => e.key === 'Escape' && (showModal = false)}
+    >
+      <div class="modal" role="dialog" aria-modal="true" aria-label="New Task">
+        <div class="modal-header">
+          <h2 class="modal-title">New Task</h2>
+          <button class="modal-close" onclick={() => showModal = false} aria-label="Close">
+            <svg width="12" height="12" viewBox="0 0 12 12" fill="none">
+              <path d="M1 1l10 10M11 1L1 11" stroke="currentColor" stroke-width="2" stroke-linecap="round"/>
+            </svg>
+          </button>
+        </div>
+
+        <div class="modal-body">
+          <label class="field">
+            <span class="field-label">Title</span>
+            <input
+              class="field-input"
+              type="text"
+              bind:value={modalTitle}
+              onkeydown={e => e.key === 'Enter' && createTask()}
+              placeholder="What needs to be done?"
+              autofocus
+            />
+          </label>
+
+          <div class="field-row">
+            <label class="field">
+              <span class="field-label">Status</span>
+              <select class="field-select" bind:value={modalStatus}>
+                <option value="todo">To Do</option>
+                <option value="in_progress">In Progress</option>
+                <option value="done">Done</option>
+              </select>
+            </label>
+            <label class="field">
+              <span class="field-label">Priority</span>
+              <select class="field-select" bind:value={modalPriority}>
+                <option value="none">None</option>
+                <option value="low">Low</option>
+                <option value="medium">Medium</option>
+                <option value="high">High</option>
+                <option value="urgent">Urgent</option>
+              </select>
+            </label>
+          </div>
+
+          <label class="field">
+            <span class="field-label">Due Date <span class="field-opt">(optional)</span></span>
+            <input class="field-input" type="date" bind:value={modalDueDate} />
+          </label>
+        </div>
+
+        <div class="modal-footer">
+          <button class="btn-cancel" onclick={() => showModal = false}>Cancel</button>
+          <button
+            class="btn-create"
+            onclick={createTask}
+            disabled={!modalTitle.trim() || modalSaving}
+          >
+            {modalSaving ? 'Creating…' : 'Create Task'}
+          </button>
+        </div>
+      </div>
+    </div>
+  {/if}
+
+  <!-- ── Error toast ── -->
+  {#if error}
+    <div class="toast" role="alert">
+      <span>{error}</span>
+      <button onclick={() => error = null} aria-label="Dismiss">✕</button>
+    </div>
+  {/if}
+
+</div>
 
 <style>
-  header {
-    background: #131426;
-    border-bottom: 1px solid rgba(255,183,27,0.15);
-    padding: 0 2rem;
+  /* ── Reset & base ── */
+  *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+  :global(html, body) {
+    height: 100%;
+    font-family: 'Inter', system-ui, sans-serif;
+    background: #0D0F1A;
+    color: #E2E8F0;
+    -webkit-font-smoothing: antialiased;
   }
 
-  .header-inner {
-    max-width: 640px;
-    margin: 0 auto;
-    height: 64px;
+  .app {
+    display: flex;
+    flex-direction: column;
+    min-height: 100vh;
+    background: #0D0F1A;
+  }
+
+  /* ── Navbar ── */
+  .navbar {
     display: flex;
     align-items: center;
     justify-content: space-between;
+    padding: 0 1.5rem;
+    height: 56px;
+    background: #111320;
+    border-bottom: 1px solid #1E2235;
+    position: sticky;
+    top: 0;
+    z-index: 100;
+    gap: 1rem;
+    flex-shrink: 0;
   }
+
+  .nav-left  { display: flex; align-items: center; gap: 1.25rem; }
+  .nav-center { flex: 1; display: flex; justify-content: center; }
+  .nav-right  { display: flex; align-items: center; }
 
   .brand {
     display: flex;
     align-items: center;
     gap: 0.5rem;
-    font-family: 'Montserrat', sans-serif;
-    font-weight: 800;
-    font-size: 1.1rem;
-    color: #fff;
-    letter-spacing: -0.3px;
+    font-size: 0.95rem;
+    font-weight: 700;
+    color: #F0F4FF;
+    letter-spacing: -0.2px;
+    white-space: nowrap;
   }
 
-  .brand-dot {
-    width: 10px;
-    height: 10px;
-    border-radius: 50%;
-    background: #FFB71B;
-    box-shadow: 0 0 8px rgba(255,183,27,0.6);
-  }
-
-  /* Header filter buttons */
-  .header-filters {
+  .brand-icon {
+    width: 26px;
+    height: 26px;
+    border-radius: 8px;
+    background: linear-gradient(135deg, #EC4899, #8B5CF6);
     display: flex;
     align-items: center;
-    gap: 0.5rem;
-  }
-
-  .hf-btn {
-    background: none;
-    border: none;
-    cursor: pointer;
-    font-family: 'Mulish', sans-serif;
-    font-size: 0.85rem;
-    color: rgba(255,255,255,0.5);
-    padding: 0.25rem 0.5rem;
-    border-radius: 6px;
-    transition: color 0.15s, background 0.15s;
-  }
-
-  .hf-btn strong { color: rgba(255,255,255,0.5); transition: color 0.15s; }
-
-  .hf-btn:hover,
-  .hf-btn.active {
-    color: #FFB71B;
-    background: rgba(255,183,27,0.1);
-  }
-
-  .hf-btn:hover strong,
-  .hf-btn.active strong { color: #FFB71B; }
-
-  .stat-divider {
-    width: 1px;
-    height: 14px;
-    background: rgba(255,255,255,0.2);
-  }
-
-  main {
-    background: #131426;
-    min-height: calc(100vh - 64px);
-    display: flex;
-    align-items: flex-start;
     justify-content: center;
-    padding: 3rem 1.5rem 4rem;
-  }
-
-  .card {
-    width: 100%;
-    max-width: 560px;
-    background: #fff;
-    border-radius: 20px;
-    padding: 2.5rem 2.5rem 2rem;
-    box-shadow: 0 24px 60px rgba(0,0,0,0.35);
-  }
-
-  .card-top {
-    display: flex;
-    align-items: flex-start;
-    justify-content: space-between;
-    margin-bottom: 2rem;
-    gap: 1rem;
-  }
-
-  h1 {
-    font-family: 'Montserrat', sans-serif;
+    font-size: 0.75rem;
     font-weight: 800;
-    font-size: 1.9rem;
-    color: #131426;
-    letter-spacing: -0.5px;
-    margin-bottom: 0.25rem;
-  }
-
-  .subtitle {
-    font-size: 0.9rem;
-    color: #6A6B6C;
-    font-family: 'Mulish', sans-serif;
-  }
-
-  /* Filter tabs */
-  .tabs {
-    display: flex;
-    gap: 0.25rem;
-    background: #F0F6FB;
-    border-radius: 10px;
-    padding: 0.25rem;
+    color: white;
     flex-shrink: 0;
   }
 
-  .tab {
-    padding: 0.375rem 0.875rem;
+  .view-tabs {
+    display: flex;
+    gap: 0.15rem;
+    background: #1A1D2E;
+    border: 1px solid #252840;
+    border-radius: 10px;
+    padding: 0.2rem;
+  }
+
+  .view-tab {
+    display: flex;
+    align-items: center;
+    gap: 0.4rem;
+    padding: 0.35rem 0.75rem;
     border: none;
     background: transparent;
     border-radius: 7px;
-    font-family: 'Mulish', sans-serif;
-    font-size: 0.85rem;
-    font-weight: 600;
-    color: #6A6B6C;
+    font-size: 0.8rem;
+    font-weight: 500;
+    font-family: inherit;
+    color: #64748B;
     cursor: pointer;
-    transition: background 0.15s, color 0.15s;
+    transition: all 0.15s;
     white-space: nowrap;
   }
 
-  .tab:hover { color: #131426; }
+  .view-tab:hover { color: #94A3B8; }
 
-  .tab.active {
-    background: #fff;
-    color: #131426;
-    box-shadow: 0 1px 4px rgba(0,0,0,0.1);
+  .view-tab.active {
+    background: #252840;
+    color: #F0F4FF;
   }
 
-  /* Error */
-  .error {
-    background: #fff5f5;
-    border: 1px solid #fca5a5;
-    border-radius: 10px;
-    padding: 0.75rem 1rem;
-    margin-bottom: 1.25rem;
+  .timer-pill {
     display: flex;
-    justify-content: space-between;
     align-items: center;
-    font-size: 0.85rem;
-    color: #dc2626;
-    font-family: 'Mulish', sans-serif;
+    gap: 0.5rem;
+    font-size: 0.8rem;
+    font-weight: 500;
+    color: #A78BFA;
+    background: rgba(167, 139, 250, 0.08);
+    border: 1px solid rgba(167, 139, 250, 0.2);
+    border-radius: 100px;
+    padding: 0.3rem 0.8rem;
+    font-family: 'JetBrains Mono', monospace;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    max-width: 300px;
   }
 
-  .error button {
+  .timer-dot {
+    width: 7px;
+    height: 7px;
+    border-radius: 50%;
+    background: #EC4899;
+    flex-shrink: 0;
+    animation: pulse 1.5s ease infinite;
+  }
+
+  @keyframes pulse {
+    0%, 100% { box-shadow: 0 0 0 0 rgba(236,72,153,0.5); }
+    50%       { box-shadow: 0 0 0 5px rgba(236,72,153,0); }
+  }
+
+  .btn-new {
+    display: flex;
+    align-items: center;
+    gap: 0.4rem;
+    padding: 0.5rem 1rem;
+    background: linear-gradient(135deg, #EC4899, #8B5CF6);
+    color: white;
+    border: none;
+    border-radius: 10px;
+    font-size: 0.82rem;
+    font-weight: 600;
+    font-family: inherit;
+    cursor: pointer;
+    transition: opacity 0.15s, transform 0.1s;
+    white-space: nowrap;
+  }
+
+  .btn-new:hover  { opacity: 0.9; transform: translateY(-1px); }
+  .btn-new:active { transform: translateY(0); }
+
+  /* ── Stats bar ── */
+  .stats-bar {
+    display: flex;
+    align-items: center;
+    gap: 1.5rem;
+    padding: 0.75rem 1.75rem;
+    background: #111320;
+    border-bottom: 1px solid #1E2235;
+    flex-shrink: 0;
+    flex-wrap: wrap;
+  }
+
+  .stat {
+    display: flex;
+    flex-direction: column;
+    align-items: flex-start;
+    gap: 0.1rem;
+  }
+
+  .stat-val {
+    font-size: 1.05rem;
+    font-weight: 700;
+    color: #E2E8F0;
+    line-height: 1.2;
+  }
+
+  .stat-lbl {
+    font-size: 0.68rem;
+    font-weight: 500;
+    color: #475569;
+    text-transform: uppercase;
+    letter-spacing: 0.06em;
+  }
+
+  .done-val { color: #34D399; }
+
+  .grad-val {
+    background: linear-gradient(135deg, #EC4899, #8B5CF6);
+    -webkit-background-clip: text;
+    -webkit-text-fill-color: transparent;
+    background-clip: text;
+  }
+
+  .stat-divider {
+    width: 1px;
+    height: 28px;
+    background: #1E2235;
+  }
+
+  .progress-stat { flex-direction: row; align-items: center; gap: 0.6rem; }
+
+  .mini-progress {
+    width: 80px;
+    height: 4px;
+    background: #1E2235;
+    border-radius: 100px;
+    overflow: hidden;
+  }
+
+  .mini-fill {
+    height: 100%;
+    background: linear-gradient(90deg, #EC4899, #8B5CF6);
+    border-radius: 100px;
+    transition: width 0.4s ease;
+  }
+
+  /* ── Content ── */
+  .content {
+    flex: 1;
+    padding: 1.5rem;
+    overflow: auto;
+  }
+
+  /* ── Board ── */
+  .board {
+    display: grid;
+    grid-template-columns: repeat(3, 1fr);
+    gap: 1.25rem;
+    align-items: start;
+    min-height: calc(100vh - 160px);
+  }
+
+  .board-col {
+    background: #111320;
+    border: 1px solid #1E2235;
+    border-radius: 14px;
+    overflow: hidden;
+    transition: border-color 0.15s, background 0.15s;
+  }
+
+  .board-col.drag-over {
+    border-color: #8B5CF6;
+    background: rgba(139, 92, 246, 0.05);
+  }
+
+  .col-header {
+    display: flex;
+    align-items: center;
+    gap: 0.5rem;
+    padding: 0.875rem 1rem;
+    border-bottom: 1px solid #1E2235;
+  }
+
+  .col-dot {
+    width: 8px;
+    height: 8px;
+    border-radius: 50%;
+    flex-shrink: 0;
+  }
+
+  .col-todo     .col-dot { background: #64748B; }
+  .col-progress .col-dot { background: #60A5FA; }
+  .col-done     .col-dot { background: #34D399; }
+
+  .col-label {
+    flex: 1;
+    font-size: 0.78rem;
+    font-weight: 600;
+    letter-spacing: 0.05em;
+    text-transform: uppercase;
+  }
+
+  .col-todo     .col-label { color: #64748B; }
+  .col-progress .col-label { color: #60A5FA; }
+  .col-done     .col-label { color: #34D399; }
+
+  .col-count {
+    font-size: 0.72rem;
+    font-weight: 600;
+    color: #334155;
+    background: #1A1D2E;
+    border-radius: 100px;
+    padding: 0.1rem 0.45rem;
+  }
+
+  .col-body {
+    padding: 0.75rem;
+    display: flex;
+    flex-direction: column;
+    gap: 0.5rem;
+    min-height: 80px;
+  }
+
+  .col-empty {
+    text-align: center;
+    font-size: 0.75rem;
+    color: #2D3148;
+    padding: 1.5rem 0;
+    border: 1.5px dashed #1E2235;
+    border-radius: 10px;
+  }
+
+  /* ── Task card ── */
+  .task-card {
+    background: #161929;
+    border: 1px solid #1E2235;
+    border-radius: 12px;
+    padding: 0.875rem;
+    cursor: grab;
+    transition: border-color 0.15s, box-shadow 0.15s, transform 0.1s, opacity 0.15s;
+    user-select: none;
+  }
+
+  .task-card:hover {
+    border-color: #2D3148;
+    box-shadow: 0 4px 16px rgba(0,0,0,0.4);
+    transform: translateY(-1px);
+  }
+
+  .task-card.dragging {
+    opacity: 0.4;
+    transform: scale(0.97);
+    cursor: grabbing;
+  }
+
+  .task-card.timing {
+    border-color: rgba(236,72,153,0.35);
+    box-shadow: 0 0 0 2px rgba(236,72,153,0.1);
+  }
+
+  .card-meta {
+    display: flex;
+    gap: 0.35rem;
+    flex-wrap: wrap;
+    margin-bottom: 0.6rem;
+    min-height: 18px;
+  }
+
+  .card-title {
+    font-size: 0.875rem;
+    font-weight: 500;
+    color: #CBD5E1;
+    line-height: 1.45;
+    margin-bottom: 0.75rem;
+  }
+
+  .done-title {
+    text-decoration: line-through;
+    color: #334155;
+  }
+
+  .card-footer {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+  }
+
+  .card-time {
+    font-size: 0.72rem;
+    font-weight: 600;
+    font-family: 'JetBrains Mono', monospace;
+    color: #334155;
+  }
+
+  .card-time.live { color: #EC4899; }
+
+  .card-actions {
+    display: flex;
+    gap: 0.3rem;
+  }
+
+  .card-btn {
+    width: 26px;
+    height: 26px;
+    border-radius: 7px;
+    border: 1px solid #252840;
+    background: #1A1D2E;
+    cursor: pointer;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    color: #475569;
+    transition: all 0.15s;
+  }
+
+  .card-btn:hover { border-color: #334155; color: #94A3B8; }
+
+  .timer-btn:hover { border-color: #EC4899; color: #EC4899; background: rgba(236,72,153,0.1); }
+  .timer-btn.active {
+    border-color: #EC4899;
+    color: #EC4899;
+    background: rgba(236,72,153,0.12);
+  }
+
+  .del-btn:hover { border-color: #F43F5E; color: #F43F5E; background: rgba(244,63,94,0.08); }
+
+  /* ── Priority badges ── */
+  .pri-badge {
+    font-size: 0.65rem;
+    font-weight: 600;
+    padding: 0.15rem 0.45rem;
+    border-radius: 100px;
+    letter-spacing: 0.03em;
+  }
+
+  .pri-low    { background: rgba(96,165,250,0.12);  color: #60A5FA; }
+  .pri-medium { background: rgba(251,191,36,0.12);  color: #FBBF24; }
+  .pri-high   { background: rgba(249,115,22,0.12);  color: #FB923C; }
+  .pri-urgent {
+    background: rgba(244,63,94,0.12);
+    color: #F43F5E;
+    animation: urgentGlow 1.5s ease infinite;
+  }
+
+  @keyframes urgentGlow {
+    0%, 100% { box-shadow: 0 0 0 0 rgba(244,63,94,0.4); }
+    50%       { box-shadow: 0 0 0 3px rgba(244,63,94,0); }
+  }
+
+  /* ── Due chips ── */
+  .due-chip {
+    font-size: 0.65rem;
+    font-weight: 600;
+    padding: 0.15rem 0.45rem;
+    border-radius: 100px;
+  }
+
+  .due-overdue { background: rgba(244,63,94,0.12);  color: #F43F5E; }
+  .due-today   { background: rgba(251,191,36,0.12); color: #FBBF24; }
+  .due-soon    { background: rgba(167,139,250,0.12);color: #A78BFA; }
+  .due-future  { background: #1A1D2E; color: #475569; }
+
+  /* ── List view ── */
+  .list-wrap {
+    background: #111320;
+    border: 1px solid #1E2235;
+    border-radius: 14px;
+    overflow: hidden;
+  }
+
+  .task-table {
+    width: 100%;
+    border-collapse: collapse;
+  }
+
+  .task-table thead th {
+    background: #0D0F1A;
+    padding: 0.65rem 0.875rem;
+    text-align: left;
+    font-size: 0.68rem;
+    font-weight: 600;
+    color: #334155;
+    text-transform: uppercase;
+    letter-spacing: 0.07em;
+    border-bottom: 1px solid #1E2235;
+    white-space: nowrap;
+  }
+
+  .th-check { width: 40px; }
+  .th-actions { width: 40px; }
+  .th-time { width: 100px; }
+  .th-status { width: 140px; }
+  .th-priority { width: 120px; }
+  .th-due { width: 120px; }
+
+  .task-row {
+    border-bottom: 1px solid #1A1D2E;
+    transition: background 0.1s;
+  }
+
+  .task-row:hover { background: #161929; }
+  .task-row:last-child { border-bottom: none; }
+
+  .task-row.row-done { opacity: 0.55; }
+
+  .task-table td {
+    padding: 0.7rem 0.875rem;
+    vertical-align: middle;
+  }
+
+  .td-check, .td-actions { text-align: center; padding: 0.7rem 0.5rem; }
+
+  /* Check button */
+  .check-btn {
+    width: 18px;
+    height: 18px;
+    border-radius: 50%;
+    border: 1.5px solid #2D3148;
+    background: transparent;
+    cursor: pointer;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    transition: all 0.15s;
+    padding: 0;
+    flex-shrink: 0;
+  }
+
+  .check-btn:hover { border-color: #EC4899; }
+  .check-btn.checked { background: #34D399; border-color: #34D399; }
+
+  /* Title cell */
+  .title-text {
+    font-size: 0.875rem;
+    font-weight: 500;
+    color: #CBD5E1;
+    cursor: default;
+  }
+
+  .title-text.done-title { text-decoration: line-through; color: #334155; }
+
+  .inline-edit {
+    background: transparent;
+    border: none;
+    border-bottom: 1.5px solid #8B5CF6;
+    outline: none;
+    font-size: 0.875rem;
+    font-weight: 500;
+    font-family: inherit;
+    color: #E2E8F0;
+    width: 100%;
+    padding: 0 0 2px;
+  }
+
+  /* Selects */
+  .sel {
+    background: transparent;
+    border: none;
+    outline: none;
+    font-size: 0.8rem;
+    font-weight: 600;
+    font-family: inherit;
+    cursor: pointer;
+    padding: 0.2rem 0.35rem;
+    border-radius: 6px;
+    transition: background 0.1s;
+    appearance: none;
+    -webkit-appearance: none;
+  }
+
+  .sel:hover { background: #1A1D2E; }
+
+  .status-todo        { color: #64748B; }
+  .status-in_progress { color: #60A5FA; }
+  .status-done        { color: #34D399; }
+
+  .pri-sel-none   { color: #334155; }
+  .pri-sel-low    { color: #60A5FA; }
+  .pri-sel-medium { color: #FBBF24; }
+  .pri-sel-high   { color: #FB923C; }
+  .pri-sel-urgent { color: #F43F5E; }
+
+  /* Due date pill */
+  .due-pill {
+    font-size: 0.75rem;
+    font-weight: 600;
+    padding: 0.2rem 0.55rem;
+    border-radius: 100px;
+  }
+
+  .no-val { color: #2D3148; font-size: 0.8rem; }
+
+  /* Time cell */
+  .td-time { white-space: nowrap; }
+
+  .time-mono {
+    font-size: 0.78rem;
+    font-weight: 600;
+    font-family: 'JetBrains Mono', monospace;
+    color: #334155;
+    margin-right: 0.4rem;
+  }
+
+  .time-mono.live { color: #EC4899; }
+
+  .row-timer {
+    width: 22px;
+    height: 22px;
+    border-radius: 6px;
+    border: 1px solid #252840;
+    background: transparent;
+    cursor: pointer;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    color: #475569;
+    transition: all 0.15s;
+    vertical-align: middle;
+  }
+
+  .row-timer:hover { border-color: #EC4899; color: #EC4899; background: rgba(236,72,153,0.08); }
+  .row-timer.active { border-color: #EC4899; color: #EC4899; background: rgba(236,72,153,0.1); }
+
+  .row-del {
+    width: 24px;
+    height: 24px;
+    border-radius: 6px;
+    border: none;
+    background: transparent;
+    cursor: pointer;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    color: #2D3148;
+    transition: all 0.15s;
+    opacity: 0;
+  }
+
+  .task-row:hover .row-del { opacity: 1; }
+  .row-del:hover { color: #F43F5E; background: rgba(244,63,94,0.08); }
+
+  /* ── Modal ── */
+  .backdrop {
+    position: fixed;
+    inset: 0;
+    background: rgba(0, 0, 0, 0.7);
+    backdrop-filter: blur(6px);
+    z-index: 200;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    padding: 1rem;
+  }
+
+  .modal {
+    background: #161929;
+    border: 1px solid #252840;
+    border-radius: 18px;
+    width: min(480px, 100%);
+    box-shadow: 0 24px 60px rgba(0,0,0,0.7);
+    overflow: hidden;
+  }
+
+  .modal-header {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    padding: 1.25rem 1.5rem;
+    border-bottom: 1px solid #1E2235;
+  }
+
+  .modal-title {
+    font-size: 1rem;
+    font-weight: 700;
+    color: #F0F4FF;
+  }
+
+  .modal-close {
+    width: 28px;
+    height: 28px;
+    border-radius: 8px;
+    border: 1px solid #252840;
+    background: transparent;
+    cursor: pointer;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    color: #475569;
+    transition: all 0.15s;
+  }
+
+  .modal-close:hover { border-color: #334155; color: #94A3B8; }
+
+  .modal-body {
+    padding: 1.5rem;
+    display: flex;
+    flex-direction: column;
+    gap: 1.1rem;
+  }
+
+  .field { display: flex; flex-direction: column; gap: 0.4rem; }
+
+  .field-label {
+    font-size: 0.75rem;
+    font-weight: 600;
+    color: #64748B;
+    text-transform: uppercase;
+    letter-spacing: 0.06em;
+  }
+
+  .field-opt { font-weight: 400; text-transform: none; letter-spacing: 0; }
+
+  .field-row { display: grid; grid-template-columns: 1fr 1fr; gap: 1rem; }
+
+  .field-input,
+  .field-select {
+    background: #1A1D2E;
+    border: 1.5px solid #252840;
+    border-radius: 10px;
+    padding: 0.65rem 0.875rem;
+    font-size: 0.875rem;
+    font-family: inherit;
+    color: #E2E8F0;
+    outline: none;
+    transition: border-color 0.15s, box-shadow 0.15s;
+    appearance: none;
+    -webkit-appearance: none;
+    width: 100%;
+  }
+
+  .field-input::placeholder { color: #2D3148; }
+
+  .field-input:focus,
+  .field-select:focus {
+    border-color: #8B5CF6;
+    box-shadow: 0 0 0 3px rgba(139,92,246,0.12);
+  }
+
+  .field-select option { background: #1A1D2E; }
+
+  .modal-footer {
+    display: flex;
+    justify-content: flex-end;
+    gap: 0.625rem;
+    padding: 1.1rem 1.5rem;
+    border-top: 1px solid #1E2235;
+  }
+
+  .btn-cancel {
+    padding: 0.6rem 1.1rem;
+    background: transparent;
+    border: 1px solid #252840;
+    border-radius: 10px;
+    font-size: 0.85rem;
+    font-weight: 600;
+    font-family: inherit;
+    color: #64748B;
+    cursor: pointer;
+    transition: all 0.15s;
+  }
+
+  .btn-cancel:hover { border-color: #334155; color: #94A3B8; }
+
+  .btn-create {
+    padding: 0.6rem 1.25rem;
+    background: linear-gradient(135deg, #EC4899, #8B5CF6);
+    border: none;
+    border-radius: 10px;
+    font-size: 0.85rem;
+    font-weight: 600;
+    font-family: inherit;
+    color: white;
+    cursor: pointer;
+    transition: opacity 0.15s, transform 0.1s;
+  }
+
+  .btn-create:hover:not(:disabled) { opacity: 0.9; transform: translateY(-1px); }
+  .btn-create:active:not(:disabled) { transform: translateY(0); }
+  .btn-create:disabled { opacity: 0.35; cursor: not-allowed; }
+
+  /* ── Toast ── */
+  .toast {
+    position: fixed;
+    bottom: 1.5rem;
+    left: 50%;
+    transform: translateX(-50%);
+    display: flex;
+    align-items: center;
+    gap: 0.75rem;
+    background: #F43F5E;
+    color: white;
+    font-size: 0.85rem;
+    font-weight: 500;
+    padding: 0.75rem 1rem;
+    border-radius: 12px;
+    box-shadow: 0 8px 24px rgba(244,63,94,0.4);
+    z-index: 300;
+    white-space: nowrap;
+  }
+
+  .toast button {
     background: none;
     border: none;
     cursor: pointer;
-    color: inherit;
+    color: white;
     opacity: 0.7;
-  }
-
-  /* Add form */
-  .add-form {
-    display: flex;
-    gap: 0.625rem;
-    margin-bottom: 1.75rem;
-  }
-
-  .add-form input {
-    flex: 1;
-    padding: 0.75rem 1.1rem;
-    border: 2px solid #ededed;
-    border-radius: 100px;
-    font-size: 0.95rem;
-    font-family: 'Mulish', sans-serif;
-    color: #131426;
-    outline: none;
-    background: #F0F6FB;
-    transition: border-color 0.2s, background 0.2s;
-  }
-
-  .add-form input::placeholder { color: #aaa; }
-  .add-form input:focus { border-color: #FFB71B; background: #fff; }
-
-  .btn-add {
-    padding: 0.75rem 1.5rem;
-    background: #FFB71B;
-    color: #131426;
-    border: 2px solid #FFB71B;
-    border-radius: 100px;
     font-size: 0.9rem;
-    font-weight: 700;
-    font-family: 'Montserrat', sans-serif;
-    letter-spacing: 0.5px;
-    cursor: pointer;
-    transition: background 0.2s, transform 0.1s;
-    white-space: nowrap;
   }
 
-  .btn-add:hover:not(:disabled) { background: #e8a400; border-color: #e8a400; transform: translateY(-1px); }
-  .btn-add:active:not(:disabled) { transform: translateY(0); }
-  .btn-add:disabled { opacity: 0.4; cursor: not-allowed; }
-
-  /* States */
-  .loading-state {
+  /* ── States ── */
+  .state-center {
     display: flex;
     flex-direction: column;
     align-items: center;
-    gap: 0.75rem;
-    padding: 2.5rem 0;
-    color: #6A6B6C;
-    font-size: 0.9rem;
-    font-family: 'Mulish', sans-serif;
+    justify-content: center;
+    gap: 1rem;
+    min-height: 320px;
+    color: #334155;
   }
 
   .spinner {
     width: 28px;
     height: 28px;
-    border: 3px solid #ededed;
-    border-top-color: #FFB71B;
+    border: 2.5px solid #1E2235;
+    border-top-color: #8B5CF6;
     border-radius: 50%;
     animation: spin 0.7s linear infinite;
   }
 
   @keyframes spin { to { transform: rotate(360deg); } }
 
-  .empty-state {
-    display: flex;
-    flex-direction: column;
-    align-items: center;
-    gap: 0.75rem;
-    padding: 2.5rem 0;
-    color: #6A6B6C;
-    font-family: 'Mulish', sans-serif;
-    font-size: 0.9rem;
-    text-align: center;
-  }
-
   .empty-icon {
-    width: 48px;
-    height: 48px;
-    border-radius: 50%;
-    background: #F0F6FB;
+    width: 52px;
+    height: 52px;
+    border-radius: 14px;
+    background: #161929;
+    border: 1px solid #1E2235;
     display: flex;
     align-items: center;
     justify-content: center;
-    font-size: 1.4rem;
-    color: #FFB71B;
-    font-weight: 700;
+    color: #334155;
   }
 
-  /* Todo list */
-  .todo-list {
-    list-style: none;
-    display: flex;
-    flex-direction: column;
-    gap: 0.5rem;
-    margin-bottom: 1.5rem;
+  .state-text {
+    font-size: 0.875rem;
+    color: #334155;
   }
 
-  .todo-list li {
-    display: flex;
-    align-items: center;
-    gap: 0.75rem;
-    padding: 0.75rem 0.875rem;
-    border-radius: 12px;
-    border: 1px solid #ededed;
-    background: #fff;
-    transition: border-color 0.15s, box-shadow 0.15s, opacity 0.2s;
+  .state-text strong { color: #64748B; }
+
+  /* ── Responsive ── */
+  @media (max-width: 900px) {
+    .board { grid-template-columns: 1fr; }
+    .timer-pill { display: none; }
+    .stats-bar { gap: 1rem; }
   }
 
-  .todo-list li:hover {
-    border-color: rgba(255,183,27,0.4);
-    box-shadow: 0 2px 12px rgba(255,183,27,0.08);
-  }
-
-  .todo-list li:hover .edit-btn { opacity: 1; }
-
-  .todo-list li.complete { background: #F0F6FB; border-color: transparent; opacity: 0.7; }
-
-  .check-btn {
-    width: 22px;
-    height: 22px;
-    border-radius: 6px;
-    border: 2px solid #ddd;
-    background: transparent;
-    cursor: pointer;
-    display: flex;
-    align-items: center;
-    justify-content: center;
-    flex-shrink: 0;
-    transition: border-color 0.15s, background 0.15s;
-    padding: 0;
-  }
-
-  .check-btn:hover { border-color: #FFB71B; }
-  .check-btn.checked { background: #FFB71B; border-color: #FFB71B; }
-
-  .title {
-    flex: 1;
-    font-size: 0.95rem;
-    font-family: 'Mulish', sans-serif;
-    font-weight: 500;
-    color: #131426;
-    cursor: default;
-  }
-
-  li.complete .title { text-decoration: line-through; color: #aaa; }
-
-  /* Inline edit input */
-  .edit-input {
-    flex: 1;
-    border: none;
-    border-bottom: 2px solid #FFB71B;
-    outline: none;
-    font-size: 0.95rem;
-    font-family: 'Mulish', sans-serif;
-    font-weight: 500;
-    color: #131426;
-    background: transparent;
-    padding: 0 0 2px;
-  }
-
-  /* Icon buttons */
-  .icon-btn {
-    background: none;
-    border: none;
-    cursor: pointer;
-    padding: 4px;
-    border-radius: 6px;
-    display: flex;
-    align-items: center;
-    justify-content: center;
-    transition: color 0.15s, background 0.15s;
-    line-height: 1;
-    flex-shrink: 0;
-  }
-
-  .edit-btn {
-    color: #ccc;
-    opacity: 0;
-    transition: color 0.15s, opacity 0.15s;
-  }
-
-  .edit-btn:hover { color: #FFB71B; background: rgba(255,183,27,0.1); opacity: 1; }
-
-  .delete-btn { color: #ccc; }
-  .delete-btn:hover { color: #ef4444; background: #fff5f5; }
-
-  /* Progress */
-  .progress-bar-wrap {
-    height: 4px;
-    background: #ededed;
-    border-radius: 100px;
-    overflow: hidden;
-    margin-bottom: 0.5rem;
-  }
-
-  .progress-bar {
-    height: 100%;
-    background: linear-gradient(90deg, #FFB71B, #e8a400);
-    border-radius: 100px;
-    transition: width 0.4s ease;
-  }
-
-  .progress-label {
-    font-size: 0.78rem;
-    color: #aaa;
-    text-align: right;
-    font-family: 'Mulish', sans-serif;
+  @media (max-width: 600px) {
+    .navbar { padding: 0 1rem; }
+    .content { padding: 1rem; }
+    .brand span:last-child { display: none; }
+    .stat-divider { display: none; }
   }
 </style>

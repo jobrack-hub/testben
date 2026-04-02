@@ -23,6 +23,8 @@ public func configure(_ app: Application) throws {
 
     // Register and auto-run migrations on startup
     app.migrations.add(CreateTodo())
+    app.migrations.add(AddTimeSpentToTodo())
+    app.migrations.add(AddProjectFields())
     try app.autoMigrate().wait()
 
     try routes(app)
