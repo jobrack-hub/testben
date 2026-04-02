@@ -13,6 +13,22 @@ struct TodoController: RouteCollection {
         }
     }
 
+    struct TodoInput: Content {
+        var title: String
+        var isComplete: Bool?
+    }
+
+    private func validatedTitle(from input: TodoInput) throws -> String {
+        let title = input.title.trimmingCharacters(in: .whitespaces)
+        guard !title.isEmpty else {
+            throw Abort(.unprocessableEntity, reason: "Title cannot be empty")
+        }
+        guard title.count <= 255 else {
+            throw Abort(.unprocessableEntity, reason: "Title must be 255 characters or fewer")
+        }
+        return title
+    }
+
     @Sendable
     func index(req: Request) async throws -> [Todo] {
         try await Todo.query(on: req.db).sort(\.$createdAt, .ascending).all()
@@ -20,9 +36,9 @@ struct TodoController: RouteCollection {
 
     @Sendable
     func create(req: Request) async throws -> Response {
-        let todo = try req.content.decode(Todo.self)
-        todo.id = nil
-        todo.isComplete = false
+        let input = try req.content.decode(TodoInput.self)
+        let title = try validatedTitle(from: input)
+        let todo = Todo(title: title)
         try await todo.save(on: req.db)
         return try await todo.encodeResponse(status: .created, for: req)
     }
@@ -40,9 +56,10 @@ struct TodoController: RouteCollection {
         guard let todo = try await Todo.find(req.parameters.get("todoID"), on: req.db) else {
             throw Abort(.notFound)
         }
-        let updated = try req.content.decode(Todo.self)
-        todo.title = updated.title
-        todo.isComplete = updated.isComplete
+        let input = try req.content.decode(TodoInput.self)
+        let title = try validatedTitle(from: input)
+        todo.title = title
+        todo.isComplete = input.isComplete ?? todo.isComplete
         try await todo.save(on: req.db)
         return todo
     }

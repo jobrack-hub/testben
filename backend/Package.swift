@@ -25,6 +25,16 @@ let package = Package(
             path: "Sources/App",
             swiftSettings: swiftSettings
         ),
+        .testTarget(
+            name: "AppTests",
+            dependencies: [
+                .target(name: "App"),
+                .product(name: "XCTVapor", package: "vapor"),
+                .product(name: "FluentSQLiteDriver", package: "fluent-sqlite-driver"),
+            ],
+            path: "Tests/AppTests",
+            swiftSettings: swiftSettings
+        ),
     ]
 )
 
