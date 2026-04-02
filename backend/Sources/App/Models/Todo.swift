@@ -10,7 +10,8 @@ final class Todo: Model, Content, @unchecked Sendable {
     @Field(key: "time_spent")  var timeSpent: Int
     @Field(key: "status")      var status: String
     @Field(key: "priority")    var priority: String
-    @OptionalField(key: "due_date") var dueDate: String?
+    @OptionalField(key: "due_date")    var dueDate: String?
+    @OptionalField(key: "description") var description: String?
     @Timestamp(key: "created_at", on: .create) var createdAt: Date?
 
     init() {}
@@ -22,7 +23,8 @@ final class Todo: Model, Content, @unchecked Sendable {
         timeSpent: Int = 0,
         status: String = "todo",
         priority: String = "none",
-        dueDate: String? = nil
+        dueDate: String? = nil,
+        description: String? = nil
     ) {
         self.id = id
         self.title = title
@@ -31,5 +33,6 @@ final class Todo: Model, Content, @unchecked Sendable {
         self.status = status
         self.priority = priority
         self.dueDate = dueDate
+        self.description = description
     }
 }

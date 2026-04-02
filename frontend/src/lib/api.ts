@@ -11,6 +11,7 @@ export interface Todo {
   status: Status;
   priority: Priority;
   dueDate: string | null; // "YYYY-MM-DD" or null
+  description: string | null;
   createdAt: string | null;
 }
 
@@ -21,6 +22,15 @@ export interface TaskInput {
   status?: Status;
   priority?: Priority;
   dueDate?: string | null;
+  description?: string | null;
+}
+
+export interface Subtask {
+  id: string;
+  todoId: string;
+  title: string;
+  isComplete: boolean;
+  createdAt: string | null;
 }
 
 async function request<T>(path: string, options?: RequestInit): Promise<T> {
@@ -40,11 +50,12 @@ export const api = {
     request<Todo>('/todos', {
       method: 'POST',
       body: JSON.stringify({
-        title:     data.title,
-        status:    data.status    ?? 'todo',
-        priority:  data.priority  ?? 'none',
-        dueDate:   data.dueDate   ?? null,
-        timeSpent: 0,
+        title:       data.title,
+        status:      data.status      ?? 'todo',
+        priority:    data.priority    ?? 'none',
+        dueDate:     data.dueDate     ?? null,
+        description: data.description ?? null,
+        timeSpent:   0,
       }),
     }),
 
@@ -59,9 +70,30 @@ export const api = {
 
   toggle: (todo: Todo) =>
     api.update(todo.id, {
-      title:      todo.title,
-      status:     todo.isComplete ? 'todo' : 'done',
-      timeSpent:  todo.timeSpent,
-      priority:   todo.priority,
+      title:       todo.title,
+      status:      todo.isComplete ? 'todo' : 'done',
+      timeSpent:   todo.timeSpent,
+      priority:    todo.priority,
+      description: todo.description,
     }),
+
+  subtasks: {
+    list: (todoId: string) =>
+      request<Subtask[]>(`/todos/${todoId}/subtasks`),
+
+    create: (todoId: string, title: string) =>
+      request<Subtask>(`/todos/${todoId}/subtasks`, {
+        method: 'POST',
+        body: JSON.stringify({ title }),
+      }),
+
+    update: (todoId: string, subtaskId: string, data: { title: string; isComplete: boolean }) =>
+      request<Subtask>(`/todos/${todoId}/subtasks/${subtaskId}`, {
+        method: 'PUT',
+        body: JSON.stringify(data),
+      }),
+
+    delete: (todoId: string, subtaskId: string) =>
+      request<void>(`/todos/${todoId}/subtasks/${subtaskId}`, { method: 'DELETE' }),
+  },
 };

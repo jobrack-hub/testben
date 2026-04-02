@@ -20,6 +20,7 @@ struct TodoController: RouteCollection {
         var status: String?
         var priority: String?
         var dueDate: String?
+        var description: String?
     }
 
     private static let validStatuses   = Set(["todo", "in_progress", "done"])
@@ -75,7 +76,8 @@ struct TodoController: RouteCollection {
             isComplete: status == "done",
             status: status,
             priority: priority,
-            dueDate: input.dueDate?.isEmpty == false ? input.dueDate : nil
+            dueDate: input.dueDate?.isEmpty == false ? input.dueDate : nil,
+            description: input.description?.isEmpty == false ? input.description : nil
         )
         try await todo.save(on: req.db)
         return try await todo.encodeResponse(status: .created, for: req)
@@ -101,6 +103,9 @@ struct TodoController: RouteCollection {
         try applyPriority(input.priority, to: todo)
         if let dd = input.dueDate {
             todo.dueDate = dd.isEmpty ? nil : dd
+        }
+        if let desc = input.description {
+            todo.description = desc.isEmpty ? nil : desc
         }
         // legacy isComplete passthrough (toggle compatibility)
         if input.status == nil, let ic = input.isComplete {

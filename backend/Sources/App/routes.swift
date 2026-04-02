@@ -4,6 +4,7 @@ func routes(_ app: Application) throws {
     let api = app.grouped("api")
     api.get("health") { req async in ["status": "ok"] }
     try api.register(collection: TodoController())
+    try api.register(collection: SubtaskController())
 
     // SPA fallback — serves index.html for root and any unmatched path
     // FileMiddleware handles /_app/* static assets; these handle HTML routing

@@ -1,6 +1,6 @@
 <script lang="ts">
   import { onMount, onDestroy } from 'svelte';
-  import { api, type Todo, type Status, type Priority, type TaskInput } from '$lib/api';
+  import { api, type Todo, type Subtask, type Status, type Priority, type TaskInput } from '$lib/api';
 
   // ── Core data ─────────────────────────────────────────────────────────────
   let todos   = $state<Todo[]>([]);
@@ -12,11 +12,12 @@
 
   // ── Modal (new task) ──────────────────────────────────────────────────────
   let showModal     = $state(false);
-  let modalTitle    = $state('');
-  let modalStatus   = $state<Status>('todo');
-  let modalPriority = $state<Priority>('none');
-  let modalDueDate  = $state('');
-  let modalSaving   = $state(false);
+  let modalTitle       = $state('');
+  let modalStatus      = $state<Status>('todo');
+  let modalPriority    = $state<Priority>('none');
+  let modalDueDate     = $state('');
+  let modalDescription = $state('');
+  let modalSaving      = $state(false);
 
   // ── Inline edit (list view) ───────────────────────────────────────────────
   let editingId    = $state<string | null>(null);
@@ -32,10 +33,35 @@
   let draggingId  = $state<string | null>(null);
   let dragOverCol = $state<Status | null>(null);
 
+  // ── Search & filter ───────────────────────────────────────────────────────
+  let searchQuery    = $state('');
+  let filterStatus   = $state<Status | 'all'>('all');
+  let filterPriority = $state<Priority | 'all'>('all');
+  let filterOverdue  = $state(false);
+
+  // ── Subtasks ──────────────────────────────────────────────────────────────
+  let expandedId     = $state<string | null>(null);
+  let subtaskMap     = $state<Record<string, Subtask[]>>({});
+  let subtaskLoading = $state<Record<string, boolean>>({});
+  let subtaskDraft   = $state<Record<string, string>>({});
+
   // ── Derived ───────────────────────────────────────────────────────────────
-  const colTodo     = $derived(todos.filter(t => t.status === 'todo'));
-  const colProgress = $derived(todos.filter(t => t.status === 'in_progress'));
-  const colDone     = $derived(todos.filter(t => t.status === 'done'));
+  const filteredTodos = $derived.by(() => {
+    let r = todos;
+    const q = searchQuery.trim().toLowerCase();
+    if (q) r = r.filter(t => t.title.toLowerCase().includes(q) || (t.description ?? '').toLowerCase().includes(q));
+    if (filterStatus !== 'all') r = r.filter(t => t.status === filterStatus);
+    if (filterPriority !== 'all') r = r.filter(t => t.priority === filterPriority);
+    if (filterOverdue) {
+      const today = new Date().toISOString().slice(0, 10);
+      r = r.filter(t => !!t.dueDate && t.dueDate < today);
+    }
+    return r;
+  });
+
+  const colTodo     = $derived(filteredTodos.filter(t => t.status === 'todo'));
+  const colProgress = $derived(filteredTodos.filter(t => t.status === 'in_progress'));
+  const colDone     = $derived(filteredTodos.filter(t => t.status === 'done'));
 
   const totalCount  = $derived(todos.length);
   const activeCount = $derived(todos.filter(t => t.status !== 'done').length);
@@ -111,6 +137,7 @@
   function openModal() {
     modalTitle = ''; modalStatus = 'todo';
     modalPriority = 'none'; modalDueDate = '';
+    modalDescription = '';
     showModal = true;
   }
 
@@ -121,9 +148,10 @@
     try {
       const task = await api.create({
         title,
-        status:   modalStatus,
-        priority: modalPriority,
-        dueDate:  modalDueDate || null,
+        status:      modalStatus,
+        priority:    modalPriority,
+        dueDate:     modalDueDate || null,
+        description: modalDescription.trim() || null,
       });
       todos = [...todos, task];
       showModal = false;
@@ -149,7 +177,7 @@
       const updated = await api.update(todo.id, {
         title: todo.title, status: todo.status,
         priority: todo.priority, timeSpent: todo.timeSpent,
-        dueDate: todo.dueDate, ...patch,
+        dueDate: todo.dueDate, description: todo.description, ...patch,
       });
       todos = todos.map(t => t.id === updated.id ? updated : t);
     } catch (e) {
@@ -176,6 +204,49 @@
   }
 
   function cancelEdit() { editingId = null; }
+
+  // ── Subtask actions ───────────────────────────────────────────────────────
+  async function toggleExpand(todo: Todo) {
+    if (expandedId === todo.id) { expandedId = null; return; }
+    expandedId = todo.id;
+    if (!subtaskMap[todo.id]) {
+      subtaskLoading = { ...subtaskLoading, [todo.id]: true };
+      try {
+        const subs = await api.subtasks.list(todo.id);
+        subtaskMap = { ...subtaskMap, [todo.id]: subs };
+      } catch { error = 'Failed to load subtasks'; }
+      finally { subtaskLoading = { ...subtaskLoading, [todo.id]: false }; }
+    }
+  }
+
+  async function addSubtask(todoId: string) {
+    const title = (subtaskDraft[todoId] ?? '').trim();
+    if (!title) return;
+    try {
+      const sub = await api.subtasks.create(todoId, title);
+      subtaskMap = { ...subtaskMap, [todoId]: [...(subtaskMap[todoId] ?? []), sub] };
+      subtaskDraft = { ...subtaskDraft, [todoId]: '' };
+    } catch { error = 'Failed to add subtask'; }
+  }
+
+  async function toggleSubtask(todoId: string, sub: Subtask) {
+    try {
+      const updated = await api.subtasks.update(todoId, sub.id, { title: sub.title, isComplete: !sub.isComplete });
+      subtaskMap = { ...subtaskMap, [todoId]: (subtaskMap[todoId] ?? []).map(s => s.id === updated.id ? updated : s) };
+    } catch { error = 'Failed to update subtask'; }
+  }
+
+  async function removeSubtask(todoId: string, subtaskId: string) {
+    try {
+      await api.subtasks.delete(todoId, subtaskId);
+      subtaskMap = { ...subtaskMap, [todoId]: (subtaskMap[todoId] ?? []).filter(s => s.id !== subtaskId) };
+    } catch { error = 'Failed to delete subtask'; }
+  }
+
+  function subtaskProgress(todoId: string) {
+    const subs = subtaskMap[todoId] ?? [];
+    return { done: subs.filter(s => s.isComplete).length, total: subs.length };
+  }
 
   // ── Drag & drop ───────────────────────────────────────────────────────────
   function onDragStart(e: DragEvent, todo: Todo) {
@@ -344,6 +415,50 @@
     {/if}
   </div>
 
+  <!-- ── Filter bar ── -->
+  <div class="filter-bar">
+    <div class="search-wrap">
+      <svg class="search-icon" width="14" height="14" viewBox="0 0 14 14" fill="none" aria-hidden="true">
+        <circle cx="6" cy="6" r="4.5" stroke="currentColor" stroke-width="1.5"/>
+        <path d="M10 10l2.5 2.5" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"/>
+      </svg>
+      <input class="search-input" type="text" placeholder="Search tasks…" bind:value={searchQuery} />
+      {#if searchQuery}
+        <button class="search-clear" onclick={() => searchQuery = ''} aria-label="Clear search">✕</button>
+      {/if}
+    </div>
+
+    <div class="filter-chips">
+      {#each ([['all','All'],['todo','To Do'],['in_progress','In Progress'],['done','Done']] as const) as [val, label]}
+        <button
+          class="chip"
+          class:chip-active={filterStatus === val}
+          onclick={() => filterStatus = val as Status | 'all'}
+        >{label}</button>
+      {/each}
+    </div>
+
+    <select class="filter-sel" bind:value={filterPriority}>
+      <option value="all">All Priorities</option>
+      <option value="none">None</option>
+      <option value="low">Low</option>
+      <option value="medium">Medium</option>
+      <option value="high">High</option>
+      <option value="urgent">Urgent</option>
+    </select>
+
+    <label class="overdue-toggle">
+      <input type="checkbox" bind:checked={filterOverdue} />
+      <span>Overdue only</span>
+    </label>
+
+    {#if searchQuery || filterStatus !== 'all' || filterPriority !== 'all' || filterOverdue}
+      <button class="clear-filters" onclick={() => { searchQuery = ''; filterStatus = 'all'; filterPriority = 'all'; filterOverdue = false; }}>
+        Clear filters
+      </button>
+    {/if}
+  </div>
+
   <!-- ── Content ── -->
   <main class="content">
 
@@ -397,11 +512,35 @@
                     {todo.title}
                   </p>
 
+                  {#if todo.description}
+                    <p class="card-desc">{todo.description.length > 80 ? todo.description.slice(0, 80) + '…' : todo.description}</p>
+                  {/if}
+
+                  {@const sp = subtaskProgress(todo.id)}
+                  {#if sp.total > 0}
+                    <div class="subtask-bar-wrap">
+                      <div class="subtask-bar">
+                        <div class="subtask-fill" style="width:{Math.round(sp.done/sp.total*100)}%"></div>
+                      </div>
+                      <span class="subtask-count">{sp.done}/{sp.total}</span>
+                    </div>
+                  {/if}
+
                   <div class="card-footer">
                     <span class="card-time" class:live={timing}>
                       {fmt(liveSeconds(todo))}
                     </span>
                     <div class="card-actions">
+                      <button
+                        class="card-btn expand-btn"
+                        class:expanded={expandedId === todo.id}
+                        onclick={() => toggleExpand(todo)}
+                        aria-label="Subtasks"
+                      >
+                        <svg width="10" height="10" viewBox="0 0 10 10" fill="none">
+                          <path d="M2 1h6M2 5h4M2 9h5" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"/>
+                        </svg>
+                      </button>
                       {#if todo.status !== 'done'}
                         <button
                           class="card-btn timer-btn"
@@ -428,6 +567,44 @@
                       </button>
                     </div>
                   </div>
+
+                  {#if expandedId === todo.id}
+                    <div class="subtask-panel">
+                      {#if subtaskLoading[todo.id]}
+                        <span class="subtask-loading">Loading…</span>
+                      {:else}
+                        {#each subtaskMap[todo.id] ?? [] as sub (sub.id)}
+                          <div class="subtask-row">
+                            <button
+                              class="sub-check"
+                              class:sub-done={sub.isComplete}
+                              onclick={() => toggleSubtask(todo.id, sub)}
+                              aria-label="Toggle subtask"
+                            >
+                              {#if sub.isComplete}
+                                <svg width="8" height="8" viewBox="0 0 8 8" fill="none">
+                                  <path d="M1 4l2 2 4-4" stroke="white" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"/>
+                                </svg>
+                              {/if}
+                            </button>
+                            <span class="sub-title" class:sub-title-done={sub.isComplete}>{sub.title}</span>
+                            <button class="sub-del" onclick={() => removeSubtask(todo.id, sub.id)} aria-label="Delete subtask">✕</button>
+                          </div>
+                        {/each}
+                        <div class="subtask-add">
+                          <input
+                            class="subtask-input"
+                            type="text"
+                            placeholder="Add subtask…"
+                            value={subtaskDraft[todo.id] ?? ''}
+                            oninput={e => subtaskDraft = { ...subtaskDraft, [todo.id]: e.currentTarget.value }}
+                            onkeydown={e => e.key === 'Enter' && addSubtask(todo.id)}
+                          />
+                          <button class="subtask-add-btn" onclick={() => addSubtask(todo.id)}>+</button>
+                        </div>
+                      {/if}
+                    </div>
+                  {/if}
                 </div>
               {/each}
 
@@ -466,7 +643,7 @@
               </tr>
             </thead>
             <tbody>
-              {#each todos as todo (todo.id)}
+              {#each filteredTodos as todo (todo.id)}
                 {@const badge = dueBadge(todo.dueDate)}
                 {@const timing = activeTimerId === todo.id}
                 <tr class="task-row" class:row-done={todo.status === 'done'}>
@@ -499,11 +676,20 @@
                         autofocus
                       />
                     {:else}
-                      <span
-                        class="title-text"
-                        class:done-title={todo.status === 'done'}
-                        ondblclick={() => startEdit(todo)}
-                      >{todo.title}</span>
+                      <div class="title-cell">
+                        <span
+                          class="title-text"
+                          class:done-title={todo.status === 'done'}
+                          ondblclick={() => startEdit(todo)}
+                        >{todo.title}</span>
+                        {#if todo.description}
+                          <span class="row-desc">{todo.description.length > 60 ? todo.description.slice(0, 60) + '…' : todo.description}</span>
+                        {/if}
+                        {@const sp = subtaskProgress(todo.id)}
+                        {#if sp.total > 0}
+                          <span class="row-subtask-badge">{sp.done}/{sp.total} subtasks</span>
+                        {/if}
+                      </div>
                     {/if}
                   </td>
 
@@ -567,6 +753,16 @@
                   </td>
 
                   <td class="td-actions">
+                    <button
+                      class="row-expand"
+                      class:expanded={expandedId === todo.id}
+                      onclick={() => toggleExpand(todo)}
+                      aria-label="Subtasks"
+                    >
+                      <svg width="10" height="10" viewBox="0 0 10 10" fill="none">
+                        <path d="M2 1h6M2 5h4M2 9h5" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"/>
+                      </svg>
+                    </button>
                     <button class="row-del" onclick={() => deleteTask(todo.id)} aria-label="Delete">
                       <svg width="11" height="11" viewBox="0 0 11 11" fill="none">
                         <path d="M1 1l9 9M10 1L1 10" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"/>
@@ -574,6 +770,48 @@
                     </button>
                   </td>
                 </tr>
+
+                {#if expandedId === todo.id}
+                  <tr class="subtask-expand-row">
+                    <td colspan="7" class="subtask-expand-cell">
+                      {#if subtaskLoading[todo.id]}
+                        <span class="subtask-loading">Loading…</span>
+                      {:else}
+                        <div class="subtask-list">
+                          {#each subtaskMap[todo.id] ?? [] as sub (sub.id)}
+                            <div class="subtask-row">
+                              <button
+                                class="sub-check"
+                                class:sub-done={sub.isComplete}
+                                onclick={() => toggleSubtask(todo.id, sub)}
+                                aria-label="Toggle subtask"
+                              >
+                                {#if sub.isComplete}
+                                  <svg width="8" height="8" viewBox="0 0 8 8" fill="none">
+                                    <path d="M1 4l2 2 4-4" stroke="white" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"/>
+                                  </svg>
+                                {/if}
+                              </button>
+                              <span class="sub-title" class:sub-title-done={sub.isComplete}>{sub.title}</span>
+                              <button class="sub-del" onclick={() => removeSubtask(todo.id, sub.id)} aria-label="Delete subtask">✕</button>
+                            </div>
+                          {/each}
+                          <div class="subtask-add">
+                            <input
+                              class="subtask-input"
+                              type="text"
+                              placeholder="Add subtask…"
+                              value={subtaskDraft[todo.id] ?? ''}
+                              oninput={e => subtaskDraft = { ...subtaskDraft, [todo.id]: e.currentTarget.value }}
+                              onkeydown={e => e.key === 'Enter' && addSubtask(todo.id)}
+                            />
+                            <button class="subtask-add-btn" onclick={() => addSubtask(todo.id)}>+</button>
+                          </div>
+                        </div>
+                      {/if}
+                    </td>
+                  </tr>
+                {/if}
               {/each}
             </tbody>
           </table>
@@ -637,6 +875,16 @@
           <label class="field">
             <span class="field-label">Due Date <span class="field-opt">(optional)</span></span>
             <input class="field-input" type="date" bind:value={modalDueDate} />
+          </label>
+
+          <label class="field">
+            <span class="field-label">Notes <span class="field-opt">(optional)</span></span>
+            <textarea
+              class="field-input field-textarea"
+              bind:value={modalDescription}
+              placeholder="Add context, links, or details…"
+              rows="3"
+            ></textarea>
           </label>
         </div>
 
@@ -1495,5 +1743,333 @@
     .content { padding: 1rem; }
     .brand span:last-child { display: none; }
     .stat-divider { display: none; }
+  }
+
+  /* ── Filter bar ── */
+  .filter-bar {
+    display: flex;
+    align-items: center;
+    gap: 0.75rem;
+    padding: 0.75rem 1.5rem;
+    background: #111320;
+    border-bottom: 1px solid #1E2235;
+    flex-wrap: wrap;
+  }
+
+  .search-wrap {
+    position: relative;
+    display: flex;
+    align-items: center;
+    flex: 0 0 200px;
+  }
+
+  .search-icon {
+    position: absolute;
+    left: 0.65rem;
+    color: #334155;
+    pointer-events: none;
+  }
+
+  .search-input {
+    width: 100%;
+    background: #1A1D2E;
+    border: 1.5px solid #252840;
+    border-radius: 9px;
+    padding: 0.45rem 2rem 0.45rem 2.1rem;
+    font-size: 0.82rem;
+    font-family: inherit;
+    color: #E2E8F0;
+    outline: none;
+    transition: border-color 0.15s;
+  }
+
+  .search-input::placeholder { color: #2D3148; }
+  .search-input:focus { border-color: #8B5CF6; }
+
+  .search-clear {
+    position: absolute;
+    right: 0.5rem;
+    background: none;
+    border: none;
+    cursor: pointer;
+    color: #334155;
+    font-size: 0.75rem;
+    padding: 0.15rem;
+    transition: color 0.15s;
+  }
+
+  .search-clear:hover { color: #94A3B8; }
+
+  .filter-chips { display: flex; gap: 0.35rem; }
+
+  .chip {
+    padding: 0.35rem 0.7rem;
+    border-radius: 20px;
+    border: 1.5px solid #252840;
+    background: transparent;
+    font-size: 0.75rem;
+    font-weight: 500;
+    font-family: inherit;
+    color: #64748B;
+    cursor: pointer;
+    transition: all 0.15s;
+    white-space: nowrap;
+  }
+
+  .chip:hover { border-color: #334155; color: #94A3B8; }
+  .chip-active { background: rgba(139,92,246,0.15); border-color: #8B5CF6; color: #C4B5FD; }
+
+  .filter-sel {
+    background: #1A1D2E;
+    border: 1.5px solid #252840;
+    border-radius: 9px;
+    padding: 0.4rem 0.7rem;
+    font-size: 0.8rem;
+    font-family: inherit;
+    color: #94A3B8;
+    outline: none;
+    cursor: pointer;
+    appearance: none;
+    -webkit-appearance: none;
+    transition: border-color 0.15s;
+  }
+
+  .filter-sel:focus { border-color: #8B5CF6; }
+  .filter-sel option { background: #1A1D2E; }
+
+  .overdue-toggle {
+    display: flex;
+    align-items: center;
+    gap: 0.4rem;
+    font-size: 0.8rem;
+    color: #64748B;
+    cursor: pointer;
+    user-select: none;
+  }
+
+  .overdue-toggle input { accent-color: #EC4899; cursor: pointer; }
+
+  .clear-filters {
+    background: none;
+    border: none;
+    font-size: 0.78rem;
+    font-family: inherit;
+    color: #EC4899;
+    cursor: pointer;
+    padding: 0.3rem 0.5rem;
+    border-radius: 6px;
+    transition: background 0.15s;
+    margin-left: auto;
+  }
+
+  .clear-filters:hover { background: rgba(236,72,153,0.1); }
+
+  /* ── Card description ── */
+  .card-desc {
+    font-size: 0.75rem;
+    color: #475569;
+    line-height: 1.45;
+    margin-top: 0.25rem;
+  }
+
+  /* ── Subtask progress bar (board cards) ── */
+  .subtask-bar-wrap {
+    display: flex;
+    align-items: center;
+    gap: 0.5rem;
+    margin-top: 0.5rem;
+  }
+
+  .subtask-bar {
+    flex: 1;
+    height: 3px;
+    background: #1E2235;
+    border-radius: 2px;
+    overflow: hidden;
+  }
+
+  .subtask-fill {
+    height: 100%;
+    background: linear-gradient(90deg, #EC4899, #8B5CF6);
+    border-radius: 2px;
+    transition: width 0.3s;
+  }
+
+  .subtask-count {
+    font-size: 0.68rem;
+    font-weight: 600;
+    color: #475569;
+    white-space: nowrap;
+    font-variant-numeric: tabular-nums;
+  }
+
+  /* ── Expand button (board card + list row) ── */
+  .expand-btn, .row-expand {
+    width: 24px;
+    height: 24px;
+    border-radius: 6px;
+    border: 1px solid #252840;
+    background: transparent;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    cursor: pointer;
+    color: #475569;
+    transition: all 0.15s;
+    flex-shrink: 0;
+  }
+
+  .expand-btn:hover, .row-expand:hover { background: #1E2235; color: #8B5CF6; border-color: #8B5CF6; }
+  .expand-btn.expanded, .row-expand.expanded { background: rgba(139,92,246,0.12); color: #8B5CF6; border-color: #8B5CF6; }
+
+  .row-expand {
+    width: 26px;
+    height: 26px;
+    margin-right: 0.25rem;
+  }
+
+  /* ── Subtask panel (card + list) ── */
+  .subtask-panel {
+    margin-top: 0.5rem;
+    padding-top: 0.625rem;
+    border-top: 1px solid #1E2235;
+  }
+
+  .subtask-expand-row td { padding: 0; }
+
+  .subtask-expand-cell {
+    padding: 0 1rem 0.75rem 3rem !important;
+    background: #0D0F1A;
+  }
+
+  .subtask-list { display: flex; flex-direction: column; gap: 0.25rem; padding-top: 0.5rem; }
+
+  .subtask-loading {
+    font-size: 0.75rem;
+    color: #334155;
+    padding: 0.5rem 0;
+  }
+
+  .subtask-row {
+    display: flex;
+    align-items: center;
+    gap: 0.5rem;
+    padding: 0.25rem 0;
+  }
+
+  .sub-check {
+    width: 16px;
+    height: 16px;
+    border-radius: 4px;
+    border: 1.5px solid #334155;
+    background: transparent;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    cursor: pointer;
+    flex-shrink: 0;
+    transition: all 0.15s;
+  }
+
+  .sub-check.sub-done { background: #8B5CF6; border-color: #8B5CF6; }
+  .sub-check:hover:not(.sub-done) { border-color: #8B5CF6; }
+
+  .sub-title {
+    flex: 1;
+    font-size: 0.8rem;
+    color: #94A3B8;
+  }
+
+  .sub-title-done {
+    text-decoration: line-through;
+    color: #334155;
+  }
+
+  .sub-del {
+    background: none;
+    border: none;
+    cursor: pointer;
+    font-size: 0.7rem;
+    color: #334155;
+    padding: 0.1rem 0.3rem;
+    border-radius: 4px;
+    transition: all 0.15s;
+    flex-shrink: 0;
+    opacity: 0;
+  }
+
+  .subtask-row:hover .sub-del { opacity: 1; }
+  .sub-del:hover { background: rgba(244,63,94,0.15); color: #F43F5E; }
+
+  .subtask-add {
+    display: flex;
+    gap: 0.4rem;
+    margin-top: 0.35rem;
+  }
+
+  .subtask-input {
+    flex: 1;
+    background: #1A1D2E;
+    border: 1px solid #252840;
+    border-radius: 7px;
+    padding: 0.35rem 0.6rem;
+    font-size: 0.78rem;
+    font-family: inherit;
+    color: #E2E8F0;
+    outline: none;
+    transition: border-color 0.15s;
+  }
+
+  .subtask-input::placeholder { color: #2D3148; }
+  .subtask-input:focus { border-color: #8B5CF6; }
+
+  .subtask-add-btn {
+    width: 26px;
+    height: 26px;
+    border-radius: 7px;
+    border: none;
+    background: linear-gradient(135deg, #EC4899, #8B5CF6);
+    color: white;
+    font-size: 1rem;
+    font-weight: 600;
+    cursor: pointer;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    flex-shrink: 0;
+    transition: opacity 0.15s;
+  }
+
+  .subtask-add-btn:hover { opacity: 0.85; }
+
+  /* ── List view title cell enhancements ── */
+  .title-cell {
+    display: flex;
+    flex-direction: column;
+    gap: 0.15rem;
+  }
+
+  .row-desc {
+    font-size: 0.72rem;
+    color: #475569;
+    line-height: 1.3;
+  }
+
+  .row-subtask-badge {
+    font-size: 0.68rem;
+    font-weight: 500;
+    color: #8B5CF6;
+    background: rgba(139,92,246,0.1);
+    border-radius: 4px;
+    padding: 0.05rem 0.35rem;
+    display: inline-block;
+    width: fit-content;
+  }
+
+  /* ── Modal textarea ── */
+  .field-textarea {
+    resize: vertical;
+    min-height: 70px;
+    line-height: 1.5;
   }
 </style>

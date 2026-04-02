@@ -12,6 +12,7 @@ const fakeTodo: Todo = {
 	status: 'todo',
 	priority: 'none',
 	dueDate: null,
+	description: null,
 	createdAt: null,
 };
 

@@ -25,6 +25,8 @@ public func configure(_ app: Application) throws {
     app.migrations.add(CreateTodo())
     app.migrations.add(AddTimeSpentToTodo())
     app.migrations.add(AddProjectFields())
+    app.migrations.add(AddDescriptionToTodo())
+    app.migrations.add(CreateSubtask())
     try app.autoMigrate().wait()
 
     try routes(app)
